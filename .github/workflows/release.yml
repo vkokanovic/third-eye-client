@@ -10,9 +10,41 @@ on:
 
 jobs:
   # ---------------------------------------------------------------------------
+  # macOS x86_64 ffmpeg bundle — built natively on Intel hardware.
+  #
+  # macos-14 runners are Apple Silicon. Homebrew's installer now refuses to
+  # bootstrap an x86_64 install under Rosetta ("Homebrew on macOS is only
+  # supported on Apple Silicon processors!"), and even after working around
+  # that, several ffmpeg dependencies no longer have x86_64 bottles published
+  # and fall back to compiling from source under emulation — over an hour and
+  # still not done. Building this leg on a native Intel runner sidesteps all
+  # of that: Homebrew behaves normally and every dependency pours as a bottle.
+  # ---------------------------------------------------------------------------
+  build-macos-ffmpeg-x86_64:
+    runs-on: macos-15-intel
+    steps:
+      - name: Bundle ffmpeg
+        run: |
+          brew install --quiet dylibbundler
+          brew install --quiet ffmpeg
+          mkdir -p ffmpeg-x86_64/lib
+          cp "$(brew --prefix)/bin/ffmpeg" ffmpeg-x86_64/ffmpeg
+          dylibbundler -od -b \
+            -x ffmpeg-x86_64/ffmpeg \
+            -d ffmpeg-x86_64/lib \
+            -p '@executable_path/lib/'
+          file ffmpeg-x86_64/ffmpeg
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ffmpeg-x86_64
+          path: ffmpeg-x86_64
+
+  # ---------------------------------------------------------------------------
   # macOS — universal .app wrapped in a .dmg
   # ---------------------------------------------------------------------------
   build-macos:
+    needs: build-macos-ffmpeg-x86_64
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v6
@@ -32,13 +64,12 @@ jobs:
             -output target/third-eye-client-universal
           lipo -info target/third-eye-client-universal
 
-      - name: Bundle ffmpeg
+      - name: Bundle ffmpeg (arm64)
         run: |
           # macos-14 runners are arm64 (Apple Silicon) natively, so plain
-          # `brew install` only gives us an arm64 binary. Rosetta 2 only
-          # translates x86_64 -> arm64; it does NOT run arm64 binaries on
-          # Intel Macs, so an arm64-only ffmpeg fails outright there
-          # ("Bad CPU type in executable"). We build both slices below.
+          # `brew install` only gives us an arm64 binary. The x86_64 slice is
+          # built natively on an Intel runner by the build-macos-ffmpeg-x86_64
+          # job and downloaded below.
           #
           # A plain lipo-merged ffmpeg still wouldn't run anywhere else,
           # though: Homebrew's ffmpeg is dynamically linked against ~20
@@ -60,32 +91,14 @@ jobs:
             -p '@executable_path/lib/'
           file ffmpeg-arm64/ffmpeg
 
-          softwareupdate --install-rosetta --agree-to-license
+      - uses: actions/download-artifact@v8
+        with:
+          name: ffmpeg-x86_64
+          path: ffmpeg-x86_64
 
-          # Homebrew's official install.sh now aborts unless `uname -m`
-          # reports arm64 ("Homebrew on macOS is only supported on Apple
-          # Silicon processors!"), so it refuses to bootstrap an x86_64
-          # Homebrew even under `arch -x86_64` / Rosetta. `brew` itself has
-          # no such restriction, so bootstrap it manually the same way
-          # install.sh would lay it out (this mirrors Homebrew's own
-          # documented portable/manual install method).
-          sudo mkdir -p /usr/local/Homebrew \
-            /usr/local/bin /usr/local/etc /usr/local/include /usr/local/lib \
-            /usr/local/sbin /usr/local/share /usr/local/var /usr/local/opt \
-            /usr/local/Cellar /usr/local/Caskroom /usr/local/Frameworks
-          sudo chown -R "$(whoami)" /usr/local/Homebrew \
-            /usr/local/bin /usr/local/etc /usr/local/include /usr/local/lib \
-            /usr/local/sbin /usr/local/share /usr/local/var /usr/local/opt \
-            /usr/local/Cellar /usr/local/Caskroom /usr/local/Frameworks
-          git clone --depth=1 https://github.com/Homebrew/brew /usr/local/Homebrew
-          ln -sf /usr/local/Homebrew/bin/brew /usr/local/bin/brew
-          arch -x86_64 /usr/local/bin/brew install --quiet ffmpeg
-          mkdir -p ffmpeg-x86_64/lib
-          cp /usr/local/bin/ffmpeg ffmpeg-x86_64/ffmpeg
-          dylibbundler -od -b \
-            -x ffmpeg-x86_64/ffmpeg \
-            -d ffmpeg-x86_64/lib \
-            -p '@executable_path/lib/'
+      - name: Restore x86_64 ffmpeg executable bit
+        run: |
+          chmod 755 ffmpeg-x86_64/ffmpeg
           file ffmpeg-x86_64/ffmpeg
 
       - name: Assemble .app bundle
@@ -118,7 +131,6 @@ jobs:
           # needed for DMG creation.
           rm -rf target
           rm -rf ffmpeg-arm64 ffmpeg-x86_64
-          sudo rm -rf /usr/local/Homebrew /usr/local/Cellar || true
 
           # Homebrew package/cache cleanup can recover significant space on
           # hosted runners.
